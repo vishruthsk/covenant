@@ -51,6 +51,87 @@ CREATED → ACCEPTED → SUBMITTED → VERIFIED → RESOLVED
 - Submits verification verdict
 - Receives fee for verification work
 
+## 🏭 Backend Architecture
+
+### Agent Lifecycle Management
+
+Both executor and verifier agents implement a robust state machine:
+
+**States:**
+- `INITIALIZING` - Validating configuration and establishing connections
+- `IDLE` - Listening for events, ready to process
+- `PROCESSING_TASK` / `VERIFYING_TASK` - Actively working on a task
+- `ERROR` - Circuit breaker triggered, requires intervention
+- `SHUTDOWN` - Graceful shutdown in progress
+
+**State Transitions:**
+```
+INITIALIZING → IDLE → PROCESSING → IDLE
+                ↓
+              ERROR (after 5 consecutive RPC failures)
+                ↓
+            SHUTDOWN (on SIGINT/SIGTERM)
+```
+
+### Error Handling & Resilience
+
+**Retry Logic:**
+- Exponential backoff for transient RPC failures
+- Configurable retry attempts (default: 3)
+- Idempotent operations only
+
+**Circuit Breaker:**
+- Tracks consecutive RPC failures
+- Enters ERROR state after threshold (default: 5)
+- Prevents cascading failures
+
+**Graceful Shutdown:**
+- Handles SIGINT and SIGTERM signals
+- Waits for current task to complete (max 5s)
+- Clean exit with status logging
+
+### Observability
+
+**Structured Logging:**
+- Timestamp on every log entry
+- Agent type and address context
+- Task ID tracking throughout lifecycle
+- Clear success (✅) and failure (❌) markers
+- Human-readable for demos, machine-parseable for production
+
+**Log Levels:**
+- `DEBUG` - State transitions, detailed execution
+- `INFO` - Normal operations (default)
+- `WARN` - Retries, low balance warnings
+- `ERROR` - Transaction failures, configuration issues
+
+### Demo Safety
+
+**Demo Mode (`DEMO_MODE=true`):**
+- Agents log all actions without sending transactions
+- Shows expected behavior and payments
+- Safe for repeated demo runs
+- No gas costs or state changes
+
+**Task Deduplication:**
+- Agents track processed/verified tasks
+- Prevents double-processing on restart
+- Idempotent event handling
+
+### Configuration Validation
+
+**Startup Checks:**
+1. Required environment variables present
+2. Private keys valid format (32-byte hex)
+3. RPC endpoint reachable
+4. Contract deployed at specified address
+5. Wallet has sufficient balance
+
+**Fail-Fast Philosophy:**
+- Clear error messages on misconfiguration
+- No silent failures
+- Actionable guidance for operators
+
 ### Task Type (MVP)
 
 **Deterministic Hash Computation:**
@@ -312,6 +393,216 @@ npm run compile
 ```bash
 npx hardhat console --network localhost
 ```
+
+## 🎬 Demo Checklist
+
+### Pre-Demo Setup (5 minutes)
+
+**1. Start Infrastructure:**
+```bash
+# Terminal 1: Start Hardhat node
+npm run node
+
+# Terminal 2: Deploy contract
+npm run deploy:localhost
+# Copy CONTRACT_ADDRESS to .env
+```
+
+**2. Verify Configuration:**
+```bash
+# Check .env has all required values:
+# - RPC_URL=http://127.0.0.1:8545
+# - CONTRACT_ADDRESS=0x... (from deployment)
+# - EXECUTOR_PRIVATE_KEY=0x...
+# - VERIFIER_PRIVATE_KEY=0x...
+# - CREATOR_PRIVATE_KEY=0x...
+```
+
+**3. Start Agents:**
+```bash
+# Terminal 3: Start executor
+npm run executor
+# Wait for "Agent started successfully" message
+
+# Terminal 4: Start verifier
+npm run verifier
+# Wait for "Agent started successfully" message
+```
+
+**4. Verify Agent Status:**
+- Both agents should show state: `IDLE`
+- Both should show "LISTENING" status
+- Check wallet balances are > 0
+
+### Running the Demo
+
+**1. Create a Task:**
+```bash
+# Terminal 5: Create test task
+npm run create-task
+```
+
+**2. Watch the Flow:**
+
+Monitor logs in this order:
+
+**Executor (Terminal 3):**
+- ✅ "New task detected" with Task ID
+- ✅ "Task accepted - escrow sufficient"
+- ✅ "Accepting task" with bond amount
+- ✅ "Task accepted" with transaction hash
+- ✅ "Submitting result" with result hash
+- ✅ "Result submitted" with transaction hash
+- ✅ "Task processing complete"
+
+**Verifier (Terminal 4):**
+- ✅ "New result submitted" with Task ID
+- ✅ "Verification started"
+- ✅ "Verification decision made" (APPROVED/REJECTED)
+- ✅ "Verification submitted" with transaction hash
+- ✅ "Verification complete"
+
+**3. Verify Completion:**
+```bash
+# Check final state (in Hardhat console or via script)
+const task = await contract.getTask(0);
+console.log('Status:', task.status); // Should be 4 (RESOLVED)
+```
+
+### Demo Mode (Safe Repeated Runs)
+
+**Enable Demo Mode:**
+```bash
+# In .env
+DEMO_MODE=true
+```
+
+**Benefits:**
+- No real transactions sent
+- No gas costs
+- Logs show "DEMO MODE: Would accept task..."
+- Safe for repeated presentations
+- Shows expected behavior without state changes
+
+**Reset for Live Demo:**
+```bash
+# In .env
+DEMO_MODE=false
+
+# Restart agents
+# Ctrl+C in executor and verifier terminals
+npm run executor
+npm run verifier
+```
+
+### Troubleshooting During Demo
+
+**Agents not responding:**
+- Check state is `IDLE` (not `ERROR`)
+- Verify RPC connection: `curl http://127.0.0.1:8545`
+- Check agent wallet balances
+
+**Transaction failures:**
+- Check gas limits in logs
+- Verify sufficient balance
+- Look for revert reasons in error logs
+
+**Circuit breaker triggered:**
+- Agent entered `ERROR` state
+- Restart agent after fixing RPC issues
+- Check consecutive failure count in logs
+
+## 📋 Operational Notes
+
+### Normal Agent Behavior
+
+**Startup Sequence:**
+1. Validate configuration (env vars, RPC, contract)
+2. Check wallet balance
+3. Enter IDLE state
+4. Start event listeners
+5. Check for existing unprocessed tasks
+
+**Task Processing:**
+1. Detect event (TaskCreated or ResultSubmitted)
+2. Transition to PROCESSING/VERIFYING state
+3. Fetch task details from contract
+4. Validate task status and parameters
+5. Execute business logic
+6. Submit transaction with retry logic
+7. Wait for confirmation
+8. Log success and return to IDLE
+
+**Error Recovery:**
+- Transient RPC failures: Automatic retry with exponential backoff
+- Persistent failures: Enter ERROR state after 5 consecutive failures
+- Configuration errors: Fail fast on startup with clear message
+
+### Common Failure Modes
+
+**1. RPC Connection Loss**
+- **Symptom:** "Retry attempt X/3" in logs
+- **Cause:** Network issues, Hardhat node stopped
+- **Recovery:** Automatic retry, or restart Hardhat node
+
+**2. Insufficient Balance**
+- **Symptom:** "Insufficient balance" error
+- **Cause:** Agent wallet ran out of ETH
+- **Recovery:** Fund wallet, agent will resume on next task
+
+**3. Circuit Breaker Triggered**
+- **Symptom:** Agent state changes to ERROR
+- **Cause:** 5+ consecutive RPC failures
+- **Recovery:** Fix RPC issues, restart agent
+
+**4. Configuration Errors**
+- **Symptom:** Agent exits immediately on startup
+- **Cause:** Missing/invalid env vars, wrong contract address
+- **Recovery:** Fix .env file, restart agent
+
+### Monitoring Best Practices
+
+**What to Watch:**
+- Agent state transitions (should cycle IDLE → PROCESSING → IDLE)
+- Consecutive failure counts (should reset to 0 on success)
+- Wallet balances (warn if < 0.1 ETH)
+- Transaction confirmation times
+- Verification verdicts (APPROVED vs REJECTED)
+
+**Log Patterns:**
+- ✅ Success markers indicate healthy operation
+- ⚠️  Warnings indicate potential issues (low balance, retries)
+- ❌ Errors require attention (transaction failures, config issues)
+
+**Health Indicators:**
+- State: IDLE (healthy) vs ERROR (needs intervention)
+- Consecutive failures: 0 (healthy) vs 5+ (circuit breaker)
+- Balance: > 0.1 ETH (healthy) vs < 0.01 ETH (critical)
+
+### Production Deployment Considerations
+
+**Before Production:**
+1. Run full test suite: `npm test`
+2. Check code coverage: `npx hardhat coverage`
+3. Audit smart contract (external security review)
+4. Test on testnet for 24+ hours
+5. Set up monitoring and alerting
+6. Prepare incident response plan
+
+**Production Configuration:**
+- Use hardware wallets or secure key management
+- Set up RPC redundancy (multiple providers)
+- Enable structured logging to centralized system
+- Configure alerting for ERROR states
+- Set appropriate retry limits and timeouts
+- Monitor wallet balances and auto-refill
+
+**Operational Runbook:**
+- Agent restart procedure
+- Wallet refill thresholds
+- Circuit breaker reset process
+- Emergency shutdown procedure
+- Incident escalation path
 
 ## 📈 Future Enhancements
 

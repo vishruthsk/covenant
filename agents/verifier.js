@@ -4,7 +4,10 @@ import crypto from 'crypto';
 
 dotenv.config();
 
-// Contract ABI (only the functions we need)
+// ============================================================================
+// CONSTANTS & CONFIGURATION
+// ============================================================================
+
 const CONTRACT_ABI = [
     "event ResultSubmitted(uint256 indexed taskId, address indexed executor, bytes32 resultHash)",
     "event ResultVerified(uint256 indexed taskId, address indexed verifier, bool isValid)",
@@ -13,36 +16,290 @@ const CONTRACT_ABI = [
     "function getTotalTasks() external view returns (uint256)"
 ];
 
+// Agent lifecycle states
+const AgentState = {
+    INITIALIZING: 'INITIALIZING',
+    IDLE: 'IDLE',
+    VERIFYING_TASK: 'VERIFYING_TASK',
+    ERROR: 'ERROR',
+    SHUTDOWN: 'SHUTDOWN'
+};
+
+// Configuration with defaults
+const CONFIG = {
+    DEMO_MODE: process.env.DEMO_MODE === 'true',
+    RETRY_ATTEMPTS: parseInt(process.env.RETRY_ATTEMPTS || '3'),
+    RETRY_DELAY_MS: parseInt(process.env.RETRY_DELAY_MS || '1000'),
+    VERIFICATION_DELAY_MS: parseInt(process.env.VERIFICATION_DELAY_MS || '2000'),
+    LOG_LEVEL: process.env.LOG_LEVEL || 'INFO', // DEBUG, INFO, WARN, ERROR
+    CIRCUIT_BREAKER_THRESHOLD: 5, // Max consecutive RPC failures before entering ERROR state
+};
+
+// ============================================================================
+// STRUCTURED LOGGING
+// ============================================================================
+
+class Logger {
+    constructor(agentType, agentAddress) {
+        this.agentType = agentType;
+        this.agentAddress = agentAddress;
+    }
+
+    _formatLog(level, action, context = {}) {
+        const timestamp = new Date().toISOString();
+        const logEntry = {
+            timestamp,
+            level,
+            agent: this.agentType,
+            address: this.agentAddress,
+            action,
+            ...context
+        };
+
+        // Human-readable format for console
+        const emoji = {
+            DEBUG: '🔍',
+            INFO: 'ℹ️ ',
+            WARN: '⚠️ ',
+            ERROR: '❌',
+            SUCCESS: '✅'
+        }[level] || 'ℹ️ ';
+
+        let message = `${emoji} [${timestamp}] [${this.agentType}] ${action}`;
+
+        if (context.taskId !== undefined) message += ` | Task: ${context.taskId}`;
+        if (context.status) message += ` | Status: ${context.status}`;
+        if (context.verdict) message += ` | Verdict: ${context.verdict}`;
+        if (context.error) message += ` | Error: ${context.error}`;
+        if (context.txHash) message += ` | Tx: ${context.txHash}`;
+
+        return { logEntry, message };
+    }
+
+    debug(action, context) {
+        if (CONFIG.LOG_LEVEL === 'DEBUG') {
+            const { message } = this._formatLog('DEBUG', action, context);
+            console.log(message);
+        }
+    }
+
+    info(action, context) {
+        const { message } = this._formatLog('INFO', action, context);
+        console.log(message);
+    }
+
+    warn(action, context) {
+        const { message } = this._formatLog('WARN', action, context);
+        console.warn(message);
+    }
+
+    error(action, context) {
+        const { message } = this._formatLog('ERROR', action, context);
+        console.error(message);
+    }
+
+    success(action, context) {
+        const { message } = this._formatLog('SUCCESS', action, context);
+        console.log(message);
+    }
+}
+
+// ============================================================================
+// RETRY LOGIC WITH EXPONENTIAL BACKOFF
+// ============================================================================
+
+async function retryWithBackoff(fn, context, maxAttempts = CONFIG.RETRY_ATTEMPTS) {
+    let lastError;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            lastError = error;
+
+            if (attempt === maxAttempts) {
+                throw error;
+            }
+
+            const delay = CONFIG.RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+            context.logger?.warn(`Retry attempt ${attempt}/${maxAttempts}`, {
+                error: error.message,
+                retryIn: `${delay}ms`
+            });
+
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+
+    throw lastError;
+}
+
+// ============================================================================
+// VERIFIER AGENT
+// ============================================================================
+
 class VerifierAgent {
     constructor() {
-        this.provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
-        this.wallet = new ethers.Wallet(process.env.VERIFIER_PRIVATE_KEY, this.provider);
-        this.contract = new ethers.Contract(
-            process.env.CONTRACT_ADDRESS,
-            CONTRACT_ABI,
-            this.wallet
-        );
+        this.state = AgentState.INITIALIZING;
+        this.stateChangedAt = Date.now();
+        this.currentTaskId = null;
+        this.verifiedTasks = new Set(); // Prevent double-verification
+        this.consecutiveRpcFailures = 0;
+        this.isShuttingDown = false;
 
-        console.log('🔍 Verifier Agent initialized');
-        console.log('📍 Address:', this.wallet.address);
-        console.log('📜 Contract:', process.env.CONTRACT_ADDRESS);
+        // Initialize logger (address will be set after wallet creation)
+        this.logger = new Logger('VERIFIER', 'pending');
+
+        this._setupShutdownHandlers();
+    }
+
+    _setupShutdownHandlers() {
+        const shutdown = async (signal) => {
+            if (this.isShuttingDown) return;
+            this.isShuttingDown = true;
+
+            this.logger.info(`Received ${signal}, shutting down gracefully...`, {
+                currentState: this.state,
+                currentTask: this.currentTaskId
+            });
+
+            this._setState(AgentState.SHUTDOWN);
+
+            // Give current verification a moment to complete
+            if (this.currentTaskId !== null) {
+                this.logger.warn('Verification in progress, waiting 5s for completion...', {
+                    taskId: this.currentTaskId
+                });
+                await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+
+            this.logger.info('Shutdown complete', { status: 'CLEAN_EXIT' });
+            process.exit(0);
+        };
+
+        process.on('SIGINT', () => shutdown('SIGINT'));
+        process.on('SIGTERM', () => shutdown('SIGTERM'));
+    }
+
+    _setState(newState) {
+        const oldState = this.state;
+        this.state = newState;
+        this.stateChangedAt = Date.now();
+
+        this.logger.debug('State transition', {
+            from: oldState,
+            to: newState,
+            currentTask: this.currentTaskId
+        });
+    }
+
+    async _validateConfig() {
+        this.logger.info('Validating configuration...');
+
+        // Check required env vars
+        const required = ['RPC_URL', 'CONTRACT_ADDRESS', 'VERIFIER_PRIVATE_KEY'];
+        const missing = required.filter(key => !process.env[key]);
+
+        if (missing.length > 0) {
+            throw new Error(`Missing required environment variables: ${missing.join(', ')}\nPlease check your .env file.`);
+        }
+
+        // Validate private key format
+        if (!process.env.VERIFIER_PRIVATE_KEY.match(/^0x[0-9a-fA-F]{64}$/)) {
+            throw new Error('VERIFIER_PRIVATE_KEY must be a valid 32-byte hex string (0x...)');
+        }
+
+        // Initialize provider and wallet
+        try {
+            this.provider = new ethers.JsonRpcProvider(process.env.RPC_URL);
+            this.wallet = new ethers.Wallet(process.env.VERIFIER_PRIVATE_KEY, this.provider);
+            this.contract = new ethers.Contract(
+                process.env.CONTRACT_ADDRESS,
+                CONTRACT_ABI,
+                this.wallet
+            );
+
+            // Update logger with actual address
+            this.logger = new Logger('VERIFIER', this.wallet.address);
+
+        } catch (error) {
+            throw new Error(`Failed to initialize ethers: ${error.message}`);
+        }
+
+        // Test RPC connection
+        try {
+            await retryWithBackoff(
+                async () => await this.provider.getBlockNumber(),
+                { logger: this.logger }
+            );
+            this.logger.success('RPC connection verified', { rpc: process.env.RPC_URL });
+        } catch (error) {
+            throw new Error(`Cannot connect to RPC at ${process.env.RPC_URL}: ${error.message}`);
+        }
+
+        // Verify contract exists
+        try {
+            const code = await this.provider.getCode(process.env.CONTRACT_ADDRESS);
+            if (code === '0x') {
+                throw new Error(`No contract deployed at ${process.env.CONTRACT_ADDRESS}`);
+            }
+            this.logger.success('Contract verified', { address: process.env.CONTRACT_ADDRESS });
+        } catch (error) {
+            throw new Error(`Contract validation failed: ${error.message}`);
+        }
+
+        // Check wallet balance
+        try {
+            const balance = await this.provider.getBalance(this.wallet.address);
+            this.logger.info('Wallet balance checked', {
+                balance: ethers.formatEther(balance) + ' ETH'
+            });
+
+            if (balance === 0n) {
+                throw new Error(`Verifier wallet has zero balance. Please fund ${this.wallet.address}`);
+            }
+
+            // Warn if balance is low (< 0.05 ETH)
+            if (balance < ethers.parseEther('0.05')) {
+                this.logger.warn('Low wallet balance', {
+                    balance: ethers.formatEther(balance) + ' ETH',
+                    recommendation: 'Fund wallet for production use'
+                });
+            }
+        } catch (error) {
+            if (error.message.includes('zero balance')) throw error;
+            throw new Error(`Balance check failed: ${error.message}`);
+        }
+
+        this.logger.success('Configuration validation complete');
+    }
+
+    _printStartupBanner() {
+        console.log('\n' + '='.repeat(70));
+        console.log('🔍 COVENANT VERIFIER AGENT');
+        console.log('='.repeat(70));
+        console.log(`Address:      ${this.wallet.address}`);
+        console.log(`Contract:     ${process.env.CONTRACT_ADDRESS}`);
+        console.log(`RPC:          ${process.env.RPC_URL}`);
+        console.log(`Demo Mode:    ${CONFIG.DEMO_MODE ? '✅ ENABLED (no real transactions)' : '❌ DISABLED (live transactions)'}`);
+        console.log(`Retry Limit:  ${CONFIG.RETRY_ATTEMPTS} attempts`);
+        console.log(`Log Level:    ${CONFIG.LOG_LEVEL}`);
+        console.log('='.repeat(70) + '\n');
     }
 
     /**
      * Independently execute the task to verify result
      */
     executeTaskIndependently(taskData) {
-        // Convert bytes32 to string (remove 0x prefix)
         const taskInput = taskData.slice(2);
-
-        // Compute SHA256 hash independently
         const hash = crypto.createHash('sha256').update(taskInput, 'hex').digest();
-
-        // Convert to bytes32 format
         const expectedHash = '0x' + hash.toString('hex');
 
-        console.log('  📊 Task Input:', taskData);
-        console.log('  🔐 Expected Result:', expectedHash);
+        this.logger.debug('Task executed independently', {
+            taskId: this.currentTaskId,
+            input: taskData,
+            expectedResult: expectedHash
+        });
 
         return expectedHash;
     }
@@ -51,26 +308,58 @@ class VerifierAgent {
      * Verify a submitted result
      */
     async verifyTask(taskId) {
+        // Prevent double-verification
+        if (this.verifiedTasks.has(taskId.toString())) {
+            this.logger.debug('Task already verified, skipping', { taskId: taskId.toString() });
+            return;
+        }
+
+        // Don't verify if in ERROR or SHUTDOWN state
+        if (this.state === AgentState.ERROR || this.state === AgentState.SHUTDOWN) {
+            this.logger.warn('Agent not in operational state, skipping verification', {
+                taskId: taskId.toString(),
+                currentState: this.state
+            });
+            return;
+        }
+
+        this._setState(AgentState.VERIFYING_TASK);
+        this.currentTaskId = taskId.toString();
+
         try {
-            console.log(`\n🔍 Verifying task ${taskId}...`);
+            this.logger.info('Verification started', { taskId: this.currentTaskId });
 
             // Get task details
-            const task = await this.contract.getTask(taskId);
+            const task = await retryWithBackoff(
+                async () => await this.contract.getTask(taskId),
+                { logger: this.logger }
+            );
 
             // Check if task is in Submitted status (2)
             if (task.status !== 2) {
-                console.log('  ⏭️  Task not in Submitted status, skipping');
+                this.logger.info('Task not in Submitted status, skipping', {
+                    taskId: this.currentTaskId,
+                    status: task.status
+                });
+                this.verifiedTasks.add(this.currentTaskId);
                 return;
             }
 
             // Check if we are the assigned verifier
             if (task.verifier.toLowerCase() !== this.wallet.address.toLowerCase()) {
-                console.log('  ⏭️  Not assigned as verifier for this task');
+                this.logger.info('Not assigned as verifier for this task', {
+                    taskId: this.currentTaskId,
+                    assignedVerifier: task.verifier
+                });
+                this.verifiedTasks.add(this.currentTaskId);
                 return;
             }
 
-            console.log('  👤 Executor:', task.executor);
-            console.log('  📝 Submitted Result:', task.resultHash);
+            this.logger.info('Verifying result', {
+                taskId: this.currentTaskId,
+                executor: task.executor,
+                submittedResult: task.resultHash
+            });
 
             // Independently execute the task
             const expectedResult = this.executeTaskIndependently(task.taskData);
@@ -78,19 +367,33 @@ class VerifierAgent {
             // Compare results
             const isValid = task.resultHash.toLowerCase() === expectedResult.toLowerCase();
 
-            if (isValid) {
-                console.log('  ✅ Result is VALID');
-            } else {
-                console.log('  ❌ Result is INVALID');
-                console.log('  Expected:', expectedResult);
-                console.log('  Got:     ', task.resultHash);
-            }
+            this.logger.info('Verification decision made', {
+                taskId: this.currentTaskId,
+                verdict: isValid ? 'APPROVED' : 'REJECTED',
+                expectedResult,
+                submittedResult: task.resultHash,
+                match: isValid
+            });
 
             // Submit verification
-            await this.submitVerification(taskId, isValid);
+            const submitted = await this.submitVerification(taskId, isValid);
+
+            if (submitted) {
+                this.verifiedTasks.add(this.currentTaskId);
+                this.logger.success('Verification complete', {
+                    taskId: this.currentTaskId,
+                    verdict: isValid ? 'APPROVED' : 'REJECTED'
+                });
+            }
 
         } catch (error) {
-            console.error('❌ Error verifying task:', error.message);
+            this.logger.error('Verification failed', {
+                taskId: this.currentTaskId,
+                error: error.message
+            });
+        } finally {
+            this.currentTaskId = null;
+            this._setState(AgentState.IDLE);
         }
     }
 
@@ -99,26 +402,85 @@ class VerifierAgent {
      */
     async submitVerification(taskId, isValid) {
         try {
-            console.log(`\n📤 Submitting verification for task ${taskId}...`);
-            console.log('  Verdict:', isValid ? 'APPROVED ✅' : 'REJECTED ❌');
+            this.logger.info('Submitting verification', {
+                taskId: taskId.toString(),
+                verdict: isValid ? 'APPROVED' : 'REJECTED'
+            });
 
-            const tx = await this.contract.verifyResult(taskId, isValid);
-            console.log('  📤 Transaction sent:', tx.hash);
+            if (CONFIG.DEMO_MODE) {
+                this.logger.warn('DEMO MODE: Would submit verification (skipping transaction)', {
+                    taskId: taskId.toString(),
+                    verdict: isValid ? 'APPROVED' : 'REJECTED'
+                });
+
+                // Calculate expected payment for demo
+                const task = await this.contract.getTask(taskId);
+                const verifierFee = task.escrowAmount * 5n / 100n;
+                const totalPayment = isValid ? verifierFee : verifierFee + task.bondAmount;
+
+                this.logger.info('DEMO MODE: Expected payment', {
+                    taskId: taskId.toString(),
+                    payment: ethers.formatEther(totalPayment) + ' ETH'
+                });
+
+                return true;
+            }
+
+            const tx = await retryWithBackoff(
+                async () => await this.contract.verifyResult(taskId, isValid),
+                { logger: this.logger }
+            );
+
+            this.logger.debug('Transaction sent', { taskId: taskId.toString(), txHash: tx.hash });
 
             const receipt = await tx.wait();
-            console.log('  ✅ Verification submitted! Gas used:', receipt.gasUsed.toString());
 
-            // Log expected payment
+            // Calculate expected payment
             const task = await this.contract.getTask(taskId);
-            const verifierFee = task.escrowAmount * 5n / 100n; // 5% fee
+            const verifierFee = task.escrowAmount * 5n / 100n;
             const totalPayment = isValid ? verifierFee : verifierFee + task.bondAmount;
 
-            console.log('  💰 Expected payment:', ethers.formatEther(totalPayment), 'ETH');
+            this.logger.success('Verification submitted', {
+                taskId: taskId.toString(),
+                verdict: isValid ? 'APPROVED' : 'REJECTED',
+                txHash: receipt.hash,
+                gasUsed: receipt.gasUsed.toString(),
+                expectedPayment: ethers.formatEther(totalPayment) + ' ETH'
+            });
 
+            this.consecutiveRpcFailures = 0; // Reset on success
             return true;
+
         } catch (error) {
-            console.error('  ❌ Error submitting verification:', error.message);
+            this._handleTransactionError('submitVerification', taskId, error);
             return false;
+        }
+    }
+
+    _handleTransactionError(action, taskId, error) {
+        this.consecutiveRpcFailures++;
+
+        // Extract revert reason if available
+        let errorMessage = error.message;
+        if (error.reason) {
+            errorMessage = error.reason;
+        } else if (error.data) {
+            errorMessage += ` (data: ${error.data})`;
+        }
+
+        this.logger.error(`Transaction failed: ${action}`, {
+            taskId: taskId.toString(),
+            error: errorMessage,
+            consecutiveFailures: this.consecutiveRpcFailures
+        });
+
+        // Circuit breaker: enter ERROR state if too many consecutive failures
+        if (this.consecutiveRpcFailures >= CONFIG.CIRCUIT_BREAKER_THRESHOLD) {
+            this.logger.error('Circuit breaker triggered - too many consecutive RPC failures', {
+                threshold: CONFIG.CIRCUIT_BREAKER_THRESHOLD,
+                status: 'ENTERING_ERROR_STATE'
+            });
+            this._setState(AgentState.ERROR);
         }
     }
 
@@ -126,23 +488,30 @@ class VerifierAgent {
      * Listen for result submissions
      */
     async listenForResults() {
-        console.log('\n👂 Listening for result submissions...\n');
+        this.logger.info('Starting event listener for result submissions');
 
-        // Listen for ResultSubmitted events
+        // Wrap event listener in try-catch to prevent crashes
         this.contract.on('ResultSubmitted', async (taskId, executor, resultHash) => {
-            console.log('\n🔔 New result submitted!');
-            console.log('  Task ID:', taskId.toString());
-            console.log('  Executor:', executor);
-            console.log('  Result Hash:', resultHash);
+            try {
+                this.logger.info('New result submitted', {
+                    taskId: taskId.toString(),
+                    executor,
+                    resultHash
+                });
 
-            // Wait a bit for the transaction to be confirmed
-            await new Promise(resolve => setTimeout(resolve, 2000));
+                // Wait for transaction confirmation
+                await new Promise(resolve => setTimeout(resolve, CONFIG.VERIFICATION_DELAY_MS));
 
-            // Verify the task
-            await this.verifyTask(taskId);
+                await this.verifyTask(taskId);
+            } catch (error) {
+                this.logger.error('Error in event handler', {
+                    taskId: taskId.toString(),
+                    error: error.message
+                });
+            }
         });
 
-        // Also check for any existing unverified tasks
+        // Check for existing unverified tasks
         await this.checkExistingTasks();
     }
 
@@ -151,10 +520,16 @@ class VerifierAgent {
      */
     async checkExistingTasks() {
         try {
-            const totalTasks = await this.contract.getTotalTasks();
-            console.log(`📋 Checking ${totalTasks} existing tasks...\n`);
+            const totalTasks = await retryWithBackoff(
+                async () => await this.contract.getTotalTasks(),
+                { logger: this.logger }
+            );
+
+            this.logger.info('Checking existing tasks', { total: totalTasks.toString() });
 
             for (let i = 0; i < totalTasks; i++) {
+                if (this.isShuttingDown) break;
+
                 const task = await this.contract.getTask(i);
 
                 // Verify if task is in Submitted status (2) and we are the verifier
@@ -163,7 +538,7 @@ class VerifierAgent {
                 }
             }
         } catch (error) {
-            console.error('❌ Error checking existing tasks:', error.message);
+            this.logger.error('Error checking existing tasks', { error: error.message });
         }
     }
 
@@ -172,35 +547,32 @@ class VerifierAgent {
      */
     async start() {
         try {
-            // Check balance
-            const balance = await this.provider.getBalance(this.wallet.address);
-            console.log('💰 Balance:', ethers.formatEther(balance), 'ETH\n');
+            await this._validateConfig();
+            this._printStartupBanner();
 
-            if (balance === 0n) {
-                console.error('❌ Insufficient balance! Please fund the verifier wallet.');
-                process.exit(1);
-            }
-
-            // Start listening
+            this._setState(AgentState.IDLE);
             await this.listenForResults();
 
+            this.logger.success('Agent started successfully', { status: 'LISTENING' });
+
         } catch (error) {
-            console.error('❌ Fatal error:', error);
+            this.logger.error('Fatal startup error', { error: error.message });
+            this._setState(AgentState.ERROR);
             process.exit(1);
         }
     }
 }
 
-// Main execution
-async function main() {
-    if (!process.env.RPC_URL || !process.env.CONTRACT_ADDRESS || !process.env.VERIFIER_PRIVATE_KEY) {
-        console.error('❌ Missing required environment variables!');
-        console.error('Please set: RPC_URL, CONTRACT_ADDRESS, VERIFIER_PRIVATE_KEY');
-        process.exit(1);
-    }
+// ============================================================================
+// MAIN EXECUTION
+// ============================================================================
 
+async function main() {
     const agent = new VerifierAgent();
     await agent.start();
 }
 
-main().catch(console.error);
+main().catch((error) => {
+    console.error('❌ Unhandled error:', error);
+    process.exit(1);
+});
